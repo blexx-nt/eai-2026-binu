@@ -1,0 +1,32 @@
+# Node
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Test and build output
+coverage/
+out/
+*.log
+
+# Local environment
+.env
+.env.local
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Never commit these to the public assignments repo
+instructor-only/
+tests/hidden/
+*-solution/
+reference-solution/

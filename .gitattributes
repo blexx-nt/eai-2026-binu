@@ -1,0 +1,20 @@
+# Shell scripts must keep LF endings or bash refuses to run them after a
+# Windows clone. See s0/.gitattributes for the same rule scoped to s0.
+*.sh        text eol=lf
+Makefile    text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.sql       text eol=lf
+*.json      text eol=lf
+*.ps1       text eol=crlf
+
+# Keep diffs readable for the data files students parse
+*.md        text
+*.ts        text
+*.py        text
+
+# Fixed-width and legacy-encoded fixtures must survive byte-for-byte:
+# PA1 ships a CP1257 file on purpose, and normalising it would remove the
+# entire point of the assignment.
+pa1/data/**  -text
+pa4/data/**  -text
