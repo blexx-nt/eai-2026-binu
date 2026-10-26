@@ -1,28 +1,16 @@
 {
-  "orderId": "ORD-1001",
+  "orderId": "WEB-2026-002",
   "orderType": "standard",
   "source": "web",
-  "receivedAt": "2026-10-26T10:00:00.000Z",
-  "orderDate": "2026-10-26T09:59:00.000Z",
+  "receivedAt": "2026-10-14T09:00:00Z",
+  "orderDate": "2026-10-14T09:00:00Z",
   "customer": {
-    "name": "Test Customer",
-    "email": "test@example.com",
-    "address": {
-      "street": "Brivibas iela 1",
-      "city": "Riga",
-      "postalCode": "LV-1010",
-      "country": "LV"
-    }
+    "name": "Anna Bērziņa",
+    "email": "anna.berzina@example.com",
+    "address": { "street": "Brīvības iela 100", "city": "Rīga", "postalCode": "LV-1001", "country": "LV" }
   },
   "items": [
-    {
-      "productId": "PROD-001",
-      "productName": "Test Product",
-      "quantity": 2,
-      "unitPrice": "24.99",
-      "currency": "EUR",
-      "taxRate": 0.21
-    }
+    { "productId": "PROD-001", "productName": "Wireless Mouse", "quantity": 2, "unitPrice": "22.50", "currency": "EUR", "taxRate": 0.21 }
   ],
   "currency": "EUR",
   "status": "new"

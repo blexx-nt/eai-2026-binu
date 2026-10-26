@@ -4,7 +4,7 @@
 
 import { randomUUID } from "node:crypto";
 import express from "express";
-import { connectWithRetry } from "../../shared/rabbit";
+import { connectWithRetry, withoutRetryHistory } from "../../shared/rabbit";
 import type { CanonicalOrder } from "../../shared/canonical-order";
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
@@ -113,14 +113,3 @@ async function main(): Promise<void> {
 }
 
 main().catch(console.error);
-
-// Replay helper: keeps correlationId (and other custom headers), drops the
-// x-death history so the replayed message gets a fresh set of attempts.
-function withoutRetryHistory(headers: Record<string, unknown> | undefined): Record<string, unknown> {
-  const copy: Record<string, unknown> = { ...(headers ?? {}) };
-  delete copy["x-death"];
-  delete copy["x-first-death-exchange"];
-  delete copy["x-first-death-queue"];
-  delete copy["x-first-death-reason"];
-  return copy;
-}
