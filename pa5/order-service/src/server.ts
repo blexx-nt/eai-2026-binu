@@ -1,47 +1,126 @@
 /**
- * PA5 order-service — EMPTY. Student implements everything below.
- *
- * Build:
- *   1. POST /orders
- *        - Body: a canonical order (../../canonical/order.schema.json,
- *          typed here as CanonicalOrder). It already has an orderId — you
- *          are not the translator, PA4 was. You do NOT add a
- *          `correlationId` field to the order object itself: the schema's
- *          additionalProperties is false, so the order body is republished
- *          exactly as received. Generate a correlationId (crypto.randomUUID()
- *          — built into Node 20, no dependency needed) and carry it ONLY in
- *          the AMQP message's custom `headers.correlationId` — see
- *          ../../docs/adr-004.md for why not the native `properties.correlationId`.
- *        - Publish to the `orders.exchange` fanout exchange:
- *            channel.publish("orders.exchange", "", Buffer.from(JSON.stringify(order)), {
- *              headers: { correlationId },
- *              contentType: "application/json",
- *            });
- *          (exchange first, routing key second — an empty string routing
- *          key for a fanout exchange, which ignores it anyway.)
- *        - Keep the order in memory, keyed by correlationId, so GET below
- *          can find it again.
- *        - Respond 201 with { correlationId, status: "accepted" }.
- *   2. GET /orders/:correlationId
- *        - 200 with { correlationId, order } if found, 404 otherwise.
- *   3. GET /health — 200 with { status: "ok" }.
- *   4. Connect to RabbitMQ with connectWithRetry from ../../shared/rabbit
- *      before accepting traffic that needs to publish.
- *
- * The listener below is scaffold plumbing only, so `docker compose up
- * --wait` succeeds against this file untouched — it is not part of the
- * assignment and you should delete it once your own app.listen(...) call
- * is what keeps the process alive.
+ * PA5 order-service: HTTP producer + DLQ replay.
  */
 
-// import express from "express";
-// import { connectWithRetry } from "../../shared/rabbit";
-// import type { CanonicalOrder } from "../../shared/canonical-order";
+import { randomUUID } from "node:crypto";
+import express from "express";
+import { connectWithRetry } from "../../shared/rabbit";
+import type { CanonicalOrder } from "../../shared/canonical-order";
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
 
-// Placeholder so `docker compose up --wait` (no HTTP routes exist yet) does
-// not exit immediately with an empty scaffold — remove once app.listen(...)
-// is in place.
-setInterval(() => {}, 1 << 30);
-console.log(`[order-service] scaffold running, no routes implemented yet (would listen on ${PORT})`);
+function isNonEmptyString(v: unknown): v is string {
+  return typeof v === "string" && v.length > 0;
+}
+
+// A handful of typeof checks, enough for this assignment.
+function looksLikeOrder(o: any): o is CanonicalOrder {
+  return (
+    o && typeof o === "object" &&
+    isNonEmptyString(o.orderId) &&
+    isNonEmptyString(o.orderType) &&
+    isNonEmptyString(o.source) &&
+    isNonEmptyString(o.receivedAt) &&
+    isNonEmptyString(o.orderDate) &&
+    isNonEmptyString(o.currency) &&
+    isNonEmptyString(o.status) &&
+    o.customer && typeof o.customer === "object" &&
+    isNonEmptyString(o.customer.name) &&
+    isNonEmptyString(o.customer.email) &&
+    o.customer.address && typeof o.customer.address === "object" &&
+    Array.isArray(o.items) && o.items.length > 0
+  );
+}
+
+async function main(): Promise<void> {
+  const { channel } = await connectWithRetry(process.env.RABBITMQ_URL!);
+
+  // Dead letter channel: replay reads from it. Same properties as the consumers.
+  await channel.assertExchange("orders.dlq.exchange", "fanout", { durable: true });
+  await channel.assertQueue("orders.dlq", { durable: true });
+  await channel.bindQueue("orders.dlq", "orders.dlq.exchange", "");
+  // Invalid channel, same properties: used for DLQ messages that cannot be replayed.
+  await channel.assertExchange("orders.invalid.exchange", "fanout", { durable: true });
+  await channel.assertQueue("orders.invalid", { durable: true });
+  await channel.bindQueue("orders.invalid", "orders.invalid.exchange", "");
+
+  const orders = new Map<string, CanonicalOrder>();
+  const app = express();
+  app.use(express.json());
+
+  app.get("/health", (_req, res) => {
+    res.json({ status: "ok" });
+  });
+
+  app.post("/orders", (req, res) => {
+    const order = req.body;
+    if (!looksLikeOrder(order)) {
+      res.status(400).json({ error: "body is not a canonical order" });
+      return;
+    }
+    const correlationId = randomUUID();
+    channel.publish("orders.exchange", "", Buffer.from(JSON.stringify(order)), {
+      headers: { correlationId }, // header only, never a body field
+      contentType: "application/json",
+      persistent: true,
+    });
+    orders.set(correlationId, order);
+    res.status(201).json({ correlationId, status: "accepted" });
+  });
+
+  app.get("/orders/:correlationId", (req, res) => {
+    const order = orders.get(req.params.correlationId);
+    if (!order) {
+      res.sendStatus(404);
+      return;
+    }
+    res.json({ correlationId: req.params.correlationId, order });
+  });
+
+  // Replay: send each DLQ message back to ONLY the consumer that failed it.
+  app.post("/dlq/replay", async (_req, res) => {
+    try {
+      const { messageCount } = await channel.checkQueue("orders.dlq");
+      let replayed = 0;
+      for (let i = 0; i < messageCount; i++) {
+        const msg = await channel.get("orders.dlq", { noAck: false });
+        if (!msg) break;
+        const origin = msg.properties.headers?.["originQueue"] as string | undefined;
+        if (!origin) {
+          // Cannot tell who failed it: move to invalid rather than lose or loop it.
+          channel.publish("orders.invalid.exchange", "", msg.content, {
+            headers: msg.properties.headers,
+            persistent: true,
+          });
+          channel.ack(msg);
+          continue;
+        }
+        channel.publish("orders.return.exchange", origin, msg.content, {
+          headers: withoutRetryHistory(msg.properties.headers),
+          persistent: true,
+        });
+        channel.ack(msg); // only after republishing
+        replayed++;
+      }
+      res.json({ replayed });
+    } catch (err) {
+      console.error("[Order] replay failed", err);
+      res.status(500).json({ error: "replay failed" });
+    }
+  });
+
+  app.listen(PORT, () => console.log(`[Order] listening on ${PORT}`));
+}
+
+main().catch(console.error);
+
+// Replay helper: keeps correlationId (and other custom headers), drops the
+// x-death history so the replayed message gets a fresh set of attempts.
+function withoutRetryHistory(headers: Record<string, unknown> | undefined): Record<string, unknown> {
+  const copy: Record<string, unknown> = { ...(headers ?? {}) };
+  delete copy["x-death"];
+  delete copy["x-first-death-exchange"];
+  delete copy["x-first-death-queue"];
+  delete copy["x-first-death-reason"];
+  return copy;
+}
