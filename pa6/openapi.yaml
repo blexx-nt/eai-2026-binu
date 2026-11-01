@@ -1,0 +1,340 @@
+openapi: 3.0.3
+info:
+  title: Checkout Orchestrator API
+  version: 1.0.0
+  description: >-
+    Orchestrates a checkout as a saga over four downstream services
+    (payment, inventory, shipping, notification). Steps run strictly in
+    sequence. When a step fails or times out, the completed steps that have
+    a compensating action are rolled back in reverse order.
+  contact:
+    name: PA6 author
+servers:
+  - url: http://localhost:3000
+    description: Local docker compose stack
+tags:
+  - name: checkout
+    description: Checkout saga operations.
+  - name: health
+    description: Service health.
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      summary: Liveness check
+      description: Returns ok when the orchestrator process is up and serving requests.
+      tags:
+        - health
+      responses:
+        "200":
+          description: The orchestrator is healthy.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+  /checkout:
+    post:
+      operationId: createCheckout
+      summary: Run the checkout saga for one canonical order
+      description: >-
+        Runs payment, inventory, shipping and notification in that order for
+        the given canonical order. The Idempotency-Key header makes the call
+        safe to retry. The same key with the same payload replays the stored
+        result without running the saga again.
+      tags:
+        - checkout
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: >-
+            Caller-chosen unique key for this checkout attempt. Reusing it with
+            a different payload is rejected, and reusing it while the first
+            request is still running is rejected.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 200
+      requestBody:
+        required: true
+        description: The canonical order to check out. At most 50 line items.
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CanonicalOrder"
+      responses:
+        "200":
+          description: All four steps succeeded and the order is completed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SagaResult"
+        "400":
+          description: >-
+            The Idempotency-Key header is missing, or the body is not a valid
+            canonical order, or it has more than 50 items (code validation_error).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: >-
+            Idempotency conflict. Code idempotency_payload_mismatch means the key
+            was used with a different payload. Code idempotency_conflict means the
+            first request with this key is still in flight.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: >-
+            A step failed. Status failed means nothing needed undoing (payment
+            failed) or a compensation failed (code compensation_failed). Status
+            compensated means earlier steps were rolled back successfully.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SagaResult"
+        "504":
+          description: >-
+            A step timed out (code timeout). Status is failed if payment timed
+            out, or compensated if earlier steps were rolled back successfully.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SagaResult"
+components:
+  schemas:
+    HealthStatus:
+      type: object
+      description: Result of the liveness check.
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          description: Always ok when the service is healthy.
+          enum:
+            - ok
+    CanonicalOrder:
+      type: object
+      description: >-
+        The canonical order shared by the PA4 translators and PA5 services,
+        restated here with a bound on items.
+      additionalProperties: false
+      required:
+        - orderId
+        - orderType
+        - source
+        - receivedAt
+        - orderDate
+        - customer
+        - items
+        - currency
+        - status
+      properties:
+        orderId:
+          type: string
+          description: The order id as given by the source system.
+          minLength: 1
+        orderType:
+          type: string
+          description: The business order type.
+          enum:
+            - standard
+            - express
+            - b2b
+        source:
+          type: string
+          description: Which translator produced this record.
+          enum:
+            - web
+            - mobile
+            - b2b
+        receivedAt:
+          type: string
+          description: When the canonical translator produced this record.
+          format: date-time
+        orderDate:
+          type: string
+          description: The order's own timestamp in ISO-8601 UTC.
+          format: date-time
+        customer:
+          $ref: "#/components/schemas/Customer"
+        items:
+          type: array
+          description: Ordered line items. The orchestrator rejects more than 50.
+          minItems: 1
+          maxItems: 50
+          items:
+            $ref: "#/components/schemas/OrderItem"
+        currency:
+          type: string
+          description: The order-level currency as declared by the source.
+        status:
+          type: string
+          description: Lifecycle status of the order.
+          enum:
+            - new
+            - processing
+            - shipped
+            - delivered
+    Customer:
+      type: object
+      description: The customer placing the order.
+      additionalProperties: false
+      required:
+        - name
+        - email
+        - address
+      properties:
+        name:
+          type: string
+          description: Customer full name.
+          minLength: 1
+        email:
+          type: string
+          description: Customer email, used as the notification recipient.
+          format: email
+        address:
+          $ref: "#/components/schemas/Address"
+    Address:
+      type: object
+      description: Postal address of the customer.
+      additionalProperties: false
+      required:
+        - street
+        - city
+        - postalCode
+        - country
+      properties:
+        street:
+          type: string
+          description: Street and number.
+          minLength: 1
+        city:
+          type: string
+          description: City name.
+          minLength: 1
+        postalCode:
+          type: string
+          description: Postal code.
+          minLength: 1
+        country:
+          type: string
+          description: ISO 3166-1 alpha-2 country code.
+    OrderItem:
+      type: object
+      description: One line item of the order.
+      additionalProperties: false
+      required:
+        - productId
+        - productName
+        - quantity
+        - unitPrice
+        - currency
+        - taxRate
+      properties:
+        productId:
+          type: string
+          description: Product identifier in the pricing API format.
+          pattern: "^PROD-[0-9]+$"
+        productName:
+          type: string
+          description: Display name of the product.
+          minLength: 1
+        quantity:
+          type: integer
+          description: Number of units ordered.
+          minimum: 1
+        unitPrice:
+          type: string
+          description: Price per unit as a decimal string with exactly two fraction digits.
+          pattern: "^-?[0-9]+\\.[0-9]{2}$"
+        currency:
+          type: string
+          description: Currency of the unit price.
+        taxRate:
+          type: number
+          description: Tax rate as a fraction, for example 0.21 for 21 percent.
+          minimum: 0
+          maximum: 1
+    SagaResult:
+      type: object
+      description: Outcome of a saga run, including every downstream call made.
+      required:
+        - orderId
+        - status
+        - trace
+      properties:
+        orderId:
+          type: string
+          description: The order this result belongs to.
+        status:
+          type: string
+          description: Overall saga outcome.
+          enum:
+            - completed
+            - failed
+            - compensated
+        code:
+          type: string
+          description: Machine-readable failure code, absent when the saga completed.
+        trace:
+          type: array
+          description: Every call the saga made, in order, compensations included.
+          maxItems: 6
+          items:
+            $ref: "#/components/schemas/TraceEntry"
+    TraceEntry:
+      type: object
+      description: One downstream call made by the saga.
+      required:
+        - step
+        - status
+        - startedAt
+        - finishedAt
+        - durationMs
+      properties:
+        step:
+          type: string
+          description: Which call this was.
+          enum:
+            - payment
+            - inventory
+            - shipping
+            - notification
+            - inventory_release
+            - payment_refund
+        status:
+          type: string
+          description: Result of the call.
+          enum:
+            - success
+            - failed
+            - timeout
+        startedAt:
+          type: string
+          description: When the call started, in ISO-8601.
+          format: date-time
+        finishedAt:
+          type: string
+          description: When the call finished, in ISO-8601.
+          format: date-time
+        durationMs:
+          type: integer
+          description: Elapsed time in whole milliseconds.
+          minimum: 0
+    ErrorResponse:
+      type: object
+      description: Error body returned for rejected requests.
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          description: Machine-readable error code.
+        message:
+          type: string
+          description: Human-readable explanation.
