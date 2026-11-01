@@ -1,3 +1,5 @@
+import type { CanonicalOrder } from "./canonical-order";
+
 export type TraceStatus = "success" | "failed" | "timeout";
 
 export interface TraceEntry {
@@ -6,13 +8,6 @@ export interface TraceEntry {
   startedAt: string;
   finishedAt: string;
   durationMs: number;
-}
-
-export interface CanonicalOrder {
-  orderId: string;
-  customer: { email: string; [k: string]: unknown };
-  items: Array<{ unitPrice: string; quantity: number; [k: string]: unknown }>;
-  [k: string]: unknown;
 }
 
 export interface SagaBody {
@@ -31,7 +26,7 @@ export interface SagaResult {
 export function toCents(price: string): number {
   const m = /^(-?)(\d+)(?:\.(\d{1,2}))?$/.exec(price.trim());
   if (!m) throw new Error(`invalid money string: ${price}`);
-  const cents = parseInt(m[2], 10) * 100 + parseInt((m[3] ?? "").padEnd(2, "0"), 10);
+  const cents = parseInt(m[2] ?? "0", 10) * 100 + parseInt((m[3] ?? "").padEnd(2, "0"), 10);
   return m[1] === "-" ? -cents : cents;
 }
 

@@ -22,6 +22,7 @@ import express, { type Request, type Response } from "express";
 import Ajv from "ajv";
 import addFormats from "ajv-formats";
 import type { CanonicalOrder } from "./canonical-order";
+import { runSaga } from "./saga";
 
 const app = express();
 app.use(express.json());
@@ -173,7 +174,10 @@ app.get("/debug/trace/:orderId", (req: Request, res: Response) => {
   res.status(200).json(saga);
 });
 
-app.post("/checkout", (req: Request, res: Response) => {
+// Keep in sync with maxItems on CanonicalOrder.items in openapi.yaml.
+const MAX_ITEMS = 50;
+
+app.post("/checkout", async (req: Request, res: Response): Promise<void> => {
   const idempotencyKey = req.header("Idempotency-Key");
   if (!idempotencyKey) {
     res.status(400).json({
@@ -188,6 +192,15 @@ app.post("/checkout", (req: Request, res: Response) => {
     res.status(400).json({
       code: "validation_error",
       message: validationError,
+    });
+    return;
+  }
+
+  const order = req.body as CanonicalOrder;
+  if (order.items.length > MAX_ITEMS) {
+    res.status(400).json({
+      code: "validation_error",
+      message: `items must contain at most ${MAX_ITEMS} entries`,
     });
     return;
   }
@@ -207,85 +220,71 @@ app.post("/checkout", (req: Request, res: Response) => {
       });
       return;
     }
-
-    // Starter behavior for in-progress/previous same-key requests is intentionally minimal.
-    // Students must implement full replay/conflict strategy and document it in the ADR.
-    res.status(409).json({
-      code: "idempotency_conflict",
-      message: "Starter scaffold does not implement duplicate replay handling yet",
-    });
+    if (existing.state === "in_progress") {
+      res.status(409).json({
+        code: "idempotency_conflict",
+        message: "A request with this Idempotency-Key is still in progress",
+      });
+      return;
+    }
+    // Same key, same payload, finished: replay the stored result exactly.
+    res.status(existing.httpStatus).json(existing.response);
     return;
   }
 
-  const order = req.body as CanonicalOrder;
   const orderId = order.orderId;
+  // No await between the read above and this write: two requests with the
+  // same key cannot both get past the guard.
   idempotencyStore.records[idempotencyKey] = {
     requestHash,
     state: "in_progress",
     httpStatus: 202,
-    response: {
-      orderId,
-      status: "in_progress",
-    },
+    response: { orderId, status: "in_progress", trace: [] },
     updatedAt: nowIso(),
   };
   writeJsonFile(IDEMPOTENCY_STORE_PATH, idempotencyStore);
 
-  // --------------------------------------------------------------------------
-  // TODO (student): Implement full orchestration flow. README.md §4 has the
-  // exact request bodies, trace step names and the outcome table.
-  //   1) payment authorize   { orderId, amount }
-  //   2) inventory reserve   { orderId, items }
-  //   3) shipping create     { orderId }
-  //   4) notification send   { orderId, recipient }
-  // with strict sequencing, trace recording, timeout handling, compensation
-  // (in reverse order of the steps that actually completed), idempotent
-  // replay policy, and restart-safe persistence updates.
-  //
-  // The canonical order carries neither an amount nor a recipient:
-  //   - amount    = the sum of unitPrice × quantity over order.items, sent as
-  //                 a decimal string with two fraction digits ("49.50").
-  //                 unitPrice is already a string: add up whole cents as
-  //                 integers, then format once. Never go through a float.
-  //   - recipient = order.customer.email
-  //
-  // config.paymentUrl / config.inventoryUrl / config.shippingUrl /
-  // config.notificationUrl / config.requestTimeoutMs are already loaded from
-  // the environment above — use them, do not hardcode downstream URLs.
-  // --------------------------------------------------------------------------
+  try {
+    const result = await runSaga(order);
+    const state = result.body.status;
 
-  const trace: TraceItem[] = [];
+    const sagaStore = readJsonFile<SagaStore>(SAGA_STORE_PATH);
+    if (!sagaStore.sagas) {
+      sagaStore.sagas = {};
+    }
+    sagaStore.sagas[orderId] = {
+      idempotencyKey,
+      state,
+      steps: result.body.trace,
+      updatedAt: nowIso(),
+    };
+    writeJsonFile(SAGA_STORE_PATH, sagaStore);
 
-  const scaffoldResponse = {
-    orderId,
-    status: "failed" as const,
-    code: "not_implemented",
-    message: "Implement orchestration logic in orchestrator/src/server.ts",
-    trace,
-  };
+    // Re-read: other requests may have written records while the saga ran.
+    const freshStore = readJsonFile<IdempotencyStore>(IDEMPOTENCY_STORE_PATH);
+    if (!freshStore.records) {
+      freshStore.records = {};
+    }
+    freshStore.records[idempotencyKey] = {
+      requestHash,
+      state,
+      httpStatus: result.httpStatus,
+      response: result.body,
+      updatedAt: nowIso(),
+    };
+    writeJsonFile(IDEMPOTENCY_STORE_PATH, freshStore);
 
-  const sagaStore = readJsonFile<SagaStore>(SAGA_STORE_PATH);
-  if (!sagaStore.sagas) {
-    sagaStore.sagas = {};
+    res.status(result.httpStatus).json(result.body);
+  } catch (err) {
+    console.error("[orchestrator] unexpected saga error", err);
+    // Release the key so the caller can retry instead of hitting a stuck in_progress record.
+    const freshStore = readJsonFile<IdempotencyStore>(IDEMPOTENCY_STORE_PATH);
+    if (freshStore.records) {
+      delete freshStore.records[idempotencyKey];
+      writeJsonFile(IDEMPOTENCY_STORE_PATH, freshStore);
+    }
+    res.status(500).json({ code: "internal_error", message: "Unexpected orchestrator error" });
   }
-  sagaStore.sagas[orderId] = {
-    idempotencyKey,
-    state: "failed",
-    steps: trace,
-    updatedAt: nowIso(),
-  };
-  writeJsonFile(SAGA_STORE_PATH, sagaStore);
-
-  idempotencyStore.records[idempotencyKey] = {
-    requestHash,
-    state: "failed",
-    httpStatus: 422,
-    response: scaffoldResponse,
-    updatedAt: nowIso(),
-  };
-  writeJsonFile(IDEMPOTENCY_STORE_PATH, idempotencyStore);
-
-  res.status(422).json(scaffoldResponse);
 });
 
 bootstrapStores();
