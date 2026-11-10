@@ -1,100 +1,90 @@
-/**
- * PA5 payment-service: the reference consumer.
- */
+import {
+  proxyActivities,
+  ActivityFailure,
+  ApplicationFailure,
+  TimeoutFailure,
+} from "@temporalio/workflow";
+import type * as activities from "../activities";
+import type { CanonicalOrder, CheckoutResult, TraceItem } from "../types";
 
-import type { Channel, ConsumeMessage } from "amqplib";
-import { connectWithRetry, getRetryCount } from "../../shared/rabbit";
-import type { CanonicalOrder } from "../../shared/canonical-order";
+const act = proxyActivities<typeof activities>({
+  startToCloseTimeout: "2500 ms",
+  retry: { maximumAttempts: 3, initialInterval: "200 ms", backoffCoefficient: 2 },
+});
 
-const QUEUE = "payments.queue";
-const RESULTS_EXCHANGE = "results.payment";
-const DLQ_EXCHANGE = process.env.DLQ_EXCHANGE ?? "orders.dlq.exchange";
-const MAX_RETRIES = Number(process.env.MAX_RETRIES) || 3;
-const FAIL_RATE = Number(process.env.PAYMENT_FAIL_RATE ?? "20"); // ?? so that 0 stays 0
-
-// A failure that will repeat identically on every attempt: never retried.
-class PermanentError extends Error {}
-
-// Exact properties from the README. Must be identical in every service.
-async function declareChannels(channel: Channel): Promise<void> {
-  await channel.assertExchange("orders.dlq.exchange", "fanout", { durable: true });
-  await channel.assertQueue("orders.dlq", { durable: true });
-  await channel.bindQueue("orders.dlq", "orders.dlq.exchange", "");
-
-  await channel.assertExchange("orders.invalid.exchange", "fanout", { durable: true });
-  await channel.assertQueue("orders.invalid", { durable: true });
-  await channel.bindQueue("orders.invalid", "orders.invalid.exchange", "");
+function toCents(price: string): number {
+  const [whole, frac = ""] = price.split(".");
+  return parseInt(whole, 10) * 100 + parseInt((frac + "00").slice(0, 2), 10);
 }
 
-async function main(): Promise<void> {
-  const { channel } = await connectWithRetry(process.env.RABBITMQ_URL!);
-  await channel.prefetch(1);
-  await declareChannels(channel); // before consuming
+function totalAmount(order: CanonicalOrder): string {
+  const cents = order.items.reduce((sum, i) => sum + toCents(i.unitPrice) * i.quantity, 0);
+  return `${Math.floor(cents / 100)}.${String(cents % 100).padStart(2, "0")}`;
+}
 
-  console.log(`[Payment] Consuming from ${QUEUE}, fail rate: ${FAIL_RATE}%`);
+type Outcome = { ok: true } | { ok: false; code: string; timeout: boolean };
 
-  await channel.consume(QUEUE, async (msg: ConsumeMessage | null) => {
-    if (!msg) return;
+export async function checkout(order: CanonicalOrder): Promise<CheckoutResult> {
+  const orderId = order.orderId;
+  const trace: TraceItem[] = [];
 
-    const correlationId = msg.properties.headers?.["correlationId"] as string | undefined;
-    const retryCount = getRetryCount(msg);
-
+  async function run(step: string, call: () => Promise<void>): Promise<Outcome> {
+    const start = new Date();
+    let outcome: Outcome = { ok: true };
     try {
-      // Parsing is inside the try: a bad body must not crash the consumer.
-      const order = JSON.parse(msg.content.toString()) as CanonicalOrder;
-
-      if (!correlationId) {
-        throw new PermanentError("missing correlationId header");
-      }
-
-      console.log(`[Payment] Processing ${correlationId} (attempt ${retryCount + 1})`);
-
-      if (Math.random() * 100 < FAIL_RATE) {
-        throw new Error("Simulated payment failure");
-      }
-
-      channel.publish(
-        RESULTS_EXCHANGE,
-        "",
-        Buffer.from(
-          JSON.stringify({
-            correlationId,
-            source: "payment",
-            status: "success",
-            timestamp: new Date().toISOString(),
-            details: { message: `Payment accepted for order ${order.orderId}` },
-          }),
-        ),
-        { headers: { correlationId }, contentType: "application/json", persistent: true },
-      );
-      channel.ack(msg);
+      await call();
     } catch (err) {
-      // 1. Permanent failure: original bytes and headers to the invalid channel, ack, no retry.
-      if (err instanceof SyntaxError || err instanceof PermanentError) {
-        channel.publish("orders.invalid.exchange", "", msg.content, {
-          headers: msg.properties.headers,
-          persistent: true,
-        });
-        channel.ack(msg);
-        console.log(`[Payment] -> INVALID (not retried): ${(err as Error).message}`);
-        return;
-      }
-
-      // 2. Temporary failure: provided retry/DLQ logic.
-      // Only changes: persistent: true, and the originQueue header that replay needs.
-      if (retryCount >= MAX_RETRIES - 1) {
-        channel.publish(DLQ_EXCHANGE, "", msg.content, {
-          headers: { ...msg.properties.headers, originQueue: QUEUE },
-          persistent: true,
-        });
-        channel.ack(msg);
-        console.log(`[Payment] -> DLQ after ${retryCount + 1} attempts: ${(err as Error).message}`);
+      if (err instanceof ActivityFailure && err.cause instanceof TimeoutFailure) {
+        outcome = { ok: false, code: "timeout", timeout: true };
+      } else if (err instanceof ActivityFailure && err.cause instanceof ApplicationFailure) {
+        outcome = { ok: false, code: err.cause.type ?? "unknown", timeout: false };
       } else {
-        channel.nack(msg, false, false);
-        console.log(`[Payment] -> Retry (attempt ${retryCount + 1}): ${(err as Error).message}`);
+        outcome = { ok: false, code: "unknown", timeout: false };
       }
     }
-  });
-}
+    const end = new Date();
+    trace.push({
+      step,
+      status: outcome.ok ? "success" : outcome.timeout ? "timeout" : "failed",
+      startedAt: start.toISOString(),
+      finishedAt: end.toISOString(),
+      durationMs: end.getTime() - start.getTime(),
+    });
+    return outcome;
+  }
 
-main().catch(console.error);
+  const steps: Array<[string, () => Promise<void>]> = [
+    ["payment", () => act.authorizePayment(orderId, totalAmount(order))],
+    ["inventory", () => act.reserveInventory(orderId, order.items)],
+    ["shipping", () => act.createShipment(orderId)],
+    ["notification", () => act.sendNotification(orderId, order.customer.email)],
+  ];
+
+  const done: string[] = [];
+  for (const [name, call] of steps) {
+    const r = await run(name, call);
+    if (r.ok) {
+      done.push(name);
+      continue;
+    }
+
+    // payment failed: nothing to undo
+    if (done.length === 0) {
+      return { orderId, status: "failed", code: r.code, trace };
+    }
+
+    // compensate newest first; shipping and notification have no undo
+    let compFailed = false;
+    if (done.includes("inventory")) {
+      if (!(await run("inventory_release", () => act.releaseInventory(orderId))).ok) compFailed = true;
+    }
+    if (done.includes("payment")) {
+      if (!(await run("payment_refund", () => act.refundPayment(orderId))).ok) compFailed = true;
+    }
+    return compFailed
+      ? { orderId, status: "failed", code: "compensation_failed", trace }
+      : { orderId, status: "compensated", code: r.code, trace };
+  }
+
+  return { orderId, status: "completed", trace };
+}
