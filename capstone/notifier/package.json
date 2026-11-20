@@ -1,0 +1,7 @@
+{
+  "name": "cap-notifier",
+  "private": true,
+  "type": "module",
+  "scripts": { "start": "tsx src/server.ts" },
+  "dependencies": { "amqplib": "^0.10.4", "express": "^4.19.2", "tsx": "^4.19.0" }
+}

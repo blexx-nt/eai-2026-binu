@@ -1,0 +1,7 @@
+FROM node:20-bookworm-slim
+WORKDIR /app
+COPY intake/package.json ./
+RUN npm install --omit=dev
+COPY intake/src ./src
+ENV CONSUME_QUEUE=
+CMD ["npm", "start"]
