@@ -1,3 +1,4 @@
+import { registerDlq } from "./dlq.js";
 import express from "express";
 import amqp from "amqplib";
 import Ajv from "ajv";
@@ -349,5 +350,6 @@ app.use((err: any, _req: any, res: any, _next: any) => {
   res.status(err?.status === 413 ? 413 : 400).json({ code: "validation_error", message: String(err?.message ?? err) });
 });
 
+registerDlq(app, { getCh: () => pubCh, getTrace: () => traceCh, confirm: publishConfirmed });
 app.listen(PORT, () => console.log(`intake listening on ${PORT}`));
 void connect();

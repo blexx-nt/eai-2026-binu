@@ -303,7 +303,7 @@ async function handleInner(ch: any, msg: any) {
       const dl = newHop("saga.dead_letter", consumeHop.hopId);
       await publishConfirmed("orders.dlq.exchange", "", msg.content, {
         persistent: true, contentType: "application/json", messageId: randomUUID(),
-        headers: { ...withoutRetryHistory(headers), correlationId: cid, causationId: dl.hopId, businessKey: bk, originQueue: QUEUE, lastError: `${step} ${r.code}` },
+        headers: { ...withoutRetryHistory(headers), correlationId: cid, causationId: dl.hopId, businessKey: bk, originQueue: QUEUE, attempts: attempt, deadLetteredAt: new Date().toISOString(), lastError: `${step} ${r.code}` },
       });
       endHop(cid, dl, "dead_lettered", { attempt, detail: { code: r.code } });
       s.state = "parked"; s.retrying = false; s.lastHop = dl.hopId; s.updatedAt = new Date().toISOString();
