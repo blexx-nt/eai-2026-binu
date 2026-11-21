@@ -17,6 +17,7 @@ const TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS ?? 2500);
 const ITEMS_MAX = Number(process.env.ORDER_ITEMS_MAX ?? 50);
 const DATA_DIR = process.env.DATA_DIR ?? "/data";
 const SCHEMA_PATH = process.env.CANONICAL_SCHEMA ?? "/canonical/order.schema.json";
+const ORCH_URL = (process.env.ORCHESTRATOR_URL || "http://orchestrator:8802");
 const KEY_RE = /^[A-Za-z0-9._:-]{1,128}$/;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -330,7 +331,8 @@ app.post("/orders", express.raw({ type: () => true, limit: "1mb" }), async (req,
   res.status(r.status).json(r.body);
 });
 
-app.get("/orders/:cid", (req, res) => {
+app.get("/orders/:cid", async (req, res) => { const o = orders[req.params.cid]; if (!o) return res.status(404).json({ code: "not_found" }); try { const r = await fetch(ORCH_URL + "/sagas/" + encodeURIComponent(req.params.cid), { signal: AbortSignal.timeout(1500) }); if (r.ok) { const s: any = await r.json(); return res.json({ ...o, state: s.state, ...(s.code ? { code: s.code } : {}), ...(s.duplicateOf ? { duplicateOf: s.duplicateOf } : {}), updatedAt: s.updatedAt ?? o.updatedAt }); } } catch {} res.json(o); });
+app.get("/orders-legacy/:cid", (req, res) => {
   const o = orders[req.params.cid];
   if (!o) return res.status(404).json({ code: "not_found" });
   res.json(o);
